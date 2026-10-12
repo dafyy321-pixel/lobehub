@@ -1132,13 +1132,16 @@ export const createReplicaEngine = <TParams, TData, TFetched = TData>(
   const patchStoredEntityRows = async <TItem>(
     id: string,
     fn: (item: TItem) => TItem | undefined,
+    scope: string = resource.scope.get(),
   ): Promise<boolean> => {
     if (!writeQueue) return true;
     if (!resource.scope.canPersist()) return false;
-    const scope = resource.scope.get();
+    // A captured scope that is no longer active: none of its entries is in
+    // memory any more (the slot moved on), so every one of its rows is patched.
+    const offScope = scope !== resource.scope.get();
     const slot = getSlot();
     const loaded = new Set(
-      slot.scope === scope
+      !offScope && slot.scope === scope
         ? Object.entries(slot.entries).map(([key, entry]) => storageKey(key, entry.query).queryKey)
         : [],
     );
@@ -1151,8 +1154,9 @@ export const createReplicaEngine = <TParams, TData, TFetched = TData>(
       console.error(`[replica:${resource.name}] failed to read the persisted index`, error);
       return false;
     }
-    // Identity changed while reading the index: those rows are not ours to touch.
-    if (resource.scope.get() !== scope) return false;
+    // Identity changed while reading the index: the loaded set no longer
+    // describes the rows (an active-scope pass only).
+    if (!offScope && resource.scope.get() !== scope) return false;
     const patches: Promise<boolean>[] = [];
     for (const queryKey of keys) {
       if (loaded.has(queryKey)) continue;
@@ -1268,22 +1272,37 @@ export const createReplicaEngine = <TParams, TData, TFetched = TData>(
     return patch;
   };
 
+  /**
+   * Confirmed patch of one entity everywhere it is loaded and in the persisted
+   * rows of unloaded entries. `scope` targets a scope captured earlier (a
+   * write confirmed after the account switched): when it is no longer active,
+   * only that scope's persisted rows are patched and the view on screen —
+   * another identity's — is left alone.
+   */
   const updateEntity = <TItem>(
     id: string,
     fn: (item: TItem) => TItem | undefined,
-    options?: { persist?: boolean },
+    options?: { persist?: boolean; scope?: string },
   ) => {
+    if (options?.scope !== undefined && options.scope !== resource.scope.get()) {
+      if (options.persist !== false) void patchStoredEntityRows(id, fn, options.scope);
+      return;
+    }
     void applyEntity(id, fn, options);
   };
 
   /**
-   * Confirmed removal of one entity everywhere (see `updateEntity`). Unlike a
-   * plain mapper returning `undefined`, it is also remembered for this scope:
+   * Confirmed removal of one entity everywhere (see `updateEntity`, including
+   * its captured `scope`). Unlike a plain mapper returning `undefined`, it is
+   * also remembered for that scope:
    * a value hydrated afterwards — even by a read already in flight — comes
    * back without the entity (see `removedEntities`).
    */
-  const removeEntity = (id: string, options?: { persist?: boolean }) => {
-    const scope = resource.scope.get();
+  const removeEntity = (id: string, options?: { persist?: boolean; scope?: string }) => {
+    const scope = options?.scope ?? resource.scope.get();
+    // A removal confirmed after the account switched belongs to the scope that
+    // asked for it: guard and patch that scope's rows, never the active view.
+    const offScope = scope !== resource.scope.get();
     const guard: { releasedAt?: number } = {};
     const guards = removedEntities.get(scope) ?? new Map<string, { releasedAt?: number }>();
     removedEntities.set(scope, guards);
@@ -1294,7 +1313,11 @@ export const createReplicaEngine = <TParams, TData, TFetched = TData>(
       guard.releasedAt = ++guardClock;
       pruneEntityGuards(scope);
     };
-    const patch = applyEntity(id, () => undefined, options);
+    const patch = offScope
+      ? options?.persist === false
+        ? undefined
+        : patchStoredEntityRows(id, () => undefined, scope)
+      : applyEntity(id, () => undefined, options);
     // Without a storage patch (`persist: false`) only reads already in flight
     // can hold the entity; with one, reads that start before it lands can too.
     // A patch that did not land (untrusted scope, unreadable index or row, a

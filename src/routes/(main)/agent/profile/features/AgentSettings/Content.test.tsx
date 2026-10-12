@@ -1,6 +1,6 @@
 import { render, screen, waitFor } from '@testing-library/react';
-import { SWRConfig } from 'swr';
 import type { ReactNode } from 'react';
+import { SWRConfig } from 'swr';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { ChatSettingsTabs } from '@/store/global/initialState';
